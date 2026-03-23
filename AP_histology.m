@@ -41,6 +41,8 @@ uimenu(gui_data.menu.images,'Text','Load images','MenuSelectedFcn', ...
     {@load_images,gui_fig});
 uimenu(gui_data.menu.images,'Text','Set channel properties','MenuSelectedFcn', ...
     {@ap_histology.set_channel_properties,gui_fig});
+uimenu(gui_data.menu.images,'Text','Set channel colors','MenuSelectedFcn', ...
+    {@channel_colorpicker,gui_fig});
 
 % Preprocessing menu
 gui_data.menu.preprocess = uimenu(gui_fig,'Text','Preprocessing');
@@ -116,8 +118,13 @@ uicontrol('style','text','units','normalized', ...
     'position',[0,ypos(2),scrollbar_label_width,ypos(4)], ...
     'String','Color min')
 
+% (channel visibility row - checkboxes created dynamically on image load)
+uicontrol('style','text','units','normalized', ...
+    'position',[0,4*scrollbar_height,scrollbar_label_width,scrollbar_height], ...
+    'String','Visible')
+
 % Draw image, set hover function (for CCF)
-im_ax = axes('Units','normalized','Position',[0,4*scrollbar_height,1,1-4*scrollbar_height]);
+im_ax = axes('Units','normalized','Position',[0,5*scrollbar_height,1,1-5*scrollbar_height]);
 gui_data.im_h = imagesc(im_ax,NaN);
 axis image off;
 gui_fig.WindowButtonMotionFcn = {@hover_label,gui_fig};
@@ -127,6 +134,10 @@ gui_data.im_text = text( ...
     interp1([0,1],gui_data.im_h.Parent.XLim,0.05), ...
     interp1([0,1],gui_data.im_h.Parent.YLim,0.05), ...
     '','color','w','BackgroundColor','k','FontSize',14);
+
+% Channel visibility (initialized after image load)
+gui_data.channel_visibility = [];
+gui_data.channel_checkboxes = [];
 
 % Save function handles for external calling
 gui_data.update = @update_image;
@@ -181,8 +192,9 @@ for curr_im = 1:length(sort_idx)
     'String',curr_text); 
     drawnow;
 
-    images{curr_im} = tiffreadVolume( ...
-        image_filenames{sort_idx(curr_im)});
+    % Modified by Jongwon, 2026-03-11: squeeze extra dimension from tiffreadVolume output (H x W x 1 x C -> H x W x C)
+    images{curr_im} = squeeze(tiffreadVolume( ...
+        image_filenames{sort_idx(curr_im)}));
 end
 gui_data.im_text.String = '';
 
@@ -191,19 +203,13 @@ n_channels = size(images{1},3);
 clim_min = squeeze(min(cell2mat(cellfun(@(x) min(x,[],[1,2]),images,'uni',false)),[],1));
 clim_max = squeeze(max(cell2mat(cellfun(@(x) max(x,[],[1,2]),images,'uni',false)),[],1));
 gui_data.clim = [clim_min,clim_max];
+% Removed by Jongwon, 2026-03-11: removed zero-range clim padding as it caused incorrect color scaling
+zero_range_idx = gui_data.clim(:,1) == gui_data.clim(:,2);
+gui_data.clim(zero_range_idx, 2) = gui_data.clim(zero_range_idx, 1) + 255;
 
 % (colors: check for interpreted metadata)
 image_metadata = ap_histology.read_image_metadata(image_filenames{1});
-if isempty(image_metadata)
-    % Default channel colors
-    default_colors = ...
-        [1,0,0;0,1,0;0,0,1; ... % RGB
-        0,1,1;1,0,1;1,1,0];     % CYM
-    if n_channels > 6
-        default_colors = hsv(n_channels);
-    end
-    channel_colors = default_colors(1:n_channels,:);
-else
+if ~isempty(image_metadata)
     % Metadata-translated channel colors
     filter_colors = {...
         "GFP",[0,1,0]; ...
@@ -218,10 +224,42 @@ else
     channel_colors = vertcat(filter_colors{filter_idx,2});
     % (brightfield: set to white)
     channel_colors(image_metadata.plane_brightfield,:) = 1;
+else
+    % Default channel colors
+    default_colors = ...
+        [1,0,0;0,1,0;0,0,1; ... % RGB
+        0,1,1;1,0,1;1,1,0];     % CYM
+    if n_channels > 6
+        default_colors = hsv(n_channels);
+    end
+    channel_colors = default_colors(1:n_channels,:);
 end
+gui_data.colors = channel_colors;
 
-gui_data.channel_colors = channel_colors;
+% Initialize channel visibility
 gui_data.channel_visibility = true(n_channels,1);
+
+% Create channel visibility checkboxes (one per channel, right of scrollbar)
+% Delete existing checkboxes if reloading
+if ~isempty(gui_data.channel_checkboxes)
+    delete(gui_data.channel_checkboxes);
+end
+scrollbar_height = 0.02;    % must match value in main GUI setup
+scrollbar_label_width = 0.1; % must match value in main GUI setup
+checkbox_width = (1 - scrollbar_label_width) / n_channels;
+gui_data.channel_checkboxes = gobjects(n_channels,1);
+for ch = 1:n_channels
+    xpos = scrollbar_label_width + (ch-1)*checkbox_width;
+    ypos_cb = [xpos, 4*scrollbar_height, checkbox_width, scrollbar_height];
+    gui_data.channel_checkboxes(ch) = uicontrol( ...
+        'style','checkbox', ...
+        'units','normalized', ...
+        'position',ypos_cb, ...
+        'Value',1, ...
+        'BackgroundColor',channel_colors(ch,:), ...
+        'String','', ...
+        'Callback',{@checkbox_channel_listener, gui_fig, ch});
+end
 
 % Set scrollbar properties
 set(gui_data.scrollbar_image, ...
@@ -230,8 +268,8 @@ set(gui_data.scrollbar_image, ...
 
 set(gui_data.scrollbar_channel, ...
     'min',1,'max',n_channels,'value',1, ...
-    'sliderstep',repmat(max(0,1/max(1,(n_channels-1))),1,2), ...
-    'backgroundcolor',gui_data.channel_colors(1,:));
+    'sliderstep',repmat(max(0,1/max(1,(length(images)-1))),1,2), ...
+    'backgroundcolor',gui_data.colors(1,:));
 
 set(gui_data.scrollbar_white, ...
     'min',0,'max',max(clim_max),'value',max(gui_data.clim(:,2)), ...
@@ -259,6 +297,26 @@ if isfield(gui_data.AP_histology_processing,'histology_ccf')
     load_aligned_atlas([],[],gui_fig);
 end
 
+end
+
+function channel_colorpicker(currentObject, eventdata, gui_fig)
+
+% Get guidata
+gui_data = guidata(gui_fig);
+n_channels = size(gui_data.colors,1);
+
+% Loop through channels, select colors
+for curr_chan = 1:n_channels
+    gui_data.colors(curr_chan,:) = ...
+        uisetcolor(gui_data.colors(curr_chan,:),sprintf('Channel %d',curr_chan));
+    % Update checkbox background color to match
+    gui_data.channel_checkboxes(curr_chan).BackgroundColor = gui_data.colors(curr_chan,:);
+end
+
+% Update guidata and image
+guidata(gui_fig,gui_data);
+update_image([], [], gui_fig);
+disp(gui_data.clim)
 end
 
 function menu_check(currentObject, eventdata, gui_fig)
@@ -292,13 +350,13 @@ else
 end
 gui_data.curr_im_idx = curr_im_idx;
 
-% Set color and color limit (turn off any channels with visibility off)
-color_vector = permute(gui_data.channel_colors,[3,4,1,2]);
+% Set color and color limit
+color_vector = permute(gui_data.colors,[3,4,1,2]);
 clim_permute = permute(gui_data.clim,[2,3,1]);
-
+% Modified by Jongwon, 2026-03-11: added +eps to denominator to prevent division by zero causing invisible images
 im_rescaled = double(min(max(gui_data.data{curr_im_idx} - ...
     clim_permute(1,1,:),0),clim_permute(2,1,:)))./ ...
-    double(clim_permute(2,1,:));
+    double(clim_permute(2,1,:)+eps);
 
 im_rgb = min(permute(sum(im_rescaled.*color_vector.* ...
     reshape(gui_data.channel_visibility,1,1,[]),3),[1,2,4,3]),1);
@@ -499,7 +557,7 @@ gui_data = guidata(gui_fig);
 curr_channel = round(gui_data.scrollbar_channel.Value);
 gui_data.scrollbar_channel.Value = curr_channel;
 gui_data.scrollbar_channel.BackgroundColor = ...
-    gui_data.channel_colors(curr_channel,:);
+    gui_data.colors(curr_channel,:);
 
 % Set black/white scrollbars for selected channel
 gui_data.scrollbar_black.Value = gui_data.clim(curr_channel,1);
@@ -582,6 +640,23 @@ gui_data.menu.view.Children(view_aligned_atlas_menu_idx).Checked = true;
 
 % Update image
 gui_data.im_text.String = '';
+update_image(currentObject, eventdata, gui_fig);
+
+end
+
+
+function checkbox_channel_listener(currentObject, eventdata, gui_fig, ch)
+
+% Get guidata
+gui_data = guidata(gui_fig);
+
+% Update channel visibility
+gui_data.channel_visibility(ch) = logical(currentObject.Value);
+
+% Update guidata
+guidata(gui_fig, gui_data);
+
+% Update image
 update_image(currentObject, eventdata, gui_fig);
 
 end
